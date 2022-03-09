@@ -1,0 +1,120 @@
+description: ManualApprovalforPatchingwithNotification
+schemaVersion: '0.3'
+assumeRole: '{{ AutomationAssumeRole }}'
+parameters:
+  AutomationAssumeRole:
+    type: String
+    description: '(Optional) The ARN of the role that allows Automation to perform the actions on your behalf.'
+    default: ''
+  INFMaintWindowStartDate:
+    type: String
+    description: '(Required) The start date of the INF maintenance window.'
+    default: ''
+  INFMaintWindowEndDate:
+    type: String
+    description: '(Required) The end date of the INF maintenance window.'
+    default: ''
+  INFMaintWindowCutOff:
+    type: Integer
+    description: 'The number of hours before the end of the maintenance window that AWS Systems Manager stops scheduling new tasks for execution.'
+    default:
+  INFMaintWindowDuration:
+    type: Integer
+    description: '(Required) The duration of the INF maintenance window.'
+    default:
+  INFMaintWindowSchedule:
+    type: String
+    description: '(Required) The schedule of the INF maintenance window in the form of a cron or rate expression.'
+    default: ''
+  INFMaintWindowScheduleTimezone:
+    type: String
+    description: 'The time zone that the scheduled INF maintenance window executions are based on, in Internet Assigned Numbers Authority (IANA) format.'
+    default: ''
+  ProductName:
+    type: String
+    description: '(Required) Operating Systems requiring patching.'
+    default: ''
+  SeverityLevel:
+    type: String
+    description: '(Required) Severity Level of the patches.'
+    default: ''
+mainSteps:
+  - name: DescribeAvailablePatches
+    action: 'aws:executeAwsApi'
+    inputs:
+      Service: ssm
+      Api: DescribeAvailablePatches
+      Filters:
+        - Key: PRODUCT
+          Values:
+            - '{{ ProductName }}'
+        - Key: SEVERITY
+          Values:
+            - '{{ SeverityLevel }}'
+    outputs:
+      - Name: CVEIds
+        Selector: $.Patches[0].CVEIds
+        Type: StringList
+  - name: approve
+    action: 'aws:approve'
+    timeoutSeconds: 259200
+    onFailure: Abort
+    inputs:
+      NotificationArn: << your SNS topic arn >>
+      Message: 'The following patches {{DescribeAvailablePatches.CVEIds}} will be applied to your instances. Please approve to apply the patches.'
+      MinRequiredApprovals: 1
+      Approvers:
+        - << IAM users' arn to receive the email notification >>
+  - name: createPatchingMaintenanceWindow
+    action: 'aws:executeAwsApi'
+    inputs:
+      Service: ssm
+      Api: CreateMaintenanceWindow
+      AllowUnassociatedTargets: False
+      Description: 'The maintenance window for patching {{DescribeAvailablePatches.CVEIds}}.'
+      Name: 'MaintenanceWindowByINFTeam'
+      StartDate: '{{INFMaintWindowStartDate}}'
+      EndDate: '{{INFMaintWindowEndDate}}'
+      Cutoff: '{{INFMaintWindowCutOff}}'
+      Duration: '{{INFMaintWindowDuration}}' 
+      Schedule: '{{INFMaintWindowSchedule}}'
+      ScheduleTimezone: '{{INFMaintWindowScheduleTimezone}}'
+    outputs:
+      - Name: WindowId
+        Selector: $.WindowId
+        Type: String
+  - name: TargetRegistration
+    action: 'aws:executeAwsApi'
+    inputs:
+      Service: ssm
+      Api: RegisterTargetWithMaintenanceWindow
+      WindowId: '$.createPatchingMaintenanceWindow.WindowId'
+      ResourceType: 'RESOURCE_GROUP'
+      Targets: '{{RESOURCE_ID}}'
+    outputs:
+      - Name: WindowTargetId
+        Selector: $.WindowTargetId
+        Type: String
+  - name: TaskRegistration
+    action: 'aws:executeAwsApi'
+    inputs:
+      Service: ssm
+      Api: RegisterTaskWithMaintenanceWindow
+      WindowId: '$.createPatchingMaintenanceWindow.WindowId'
+      TaskType: 'RUN_COMMAND'
+      TaskArn: 'AWS-RunPatchBaseline'
+      Targets: '{{WINDOW_TARGET_ID}}'
+      MaxConcurrency: '5'
+      MaxErrors: '1'
+      TaskInvocationParameters:
+        - Parameters:
+            DocumentVersion: '\$DEFAULT'
+            Operation: 'Install'
+            RebootOption: 'RebootIfNeeded'
+            NotificationConfig:
+              NotificationArn: << your SNS topic arn >>
+              NotificationEvents:
+                - Success
+                - Failed
+              NotificationType: Invocation
+            ServiceRoleArn: << service role arn >>
